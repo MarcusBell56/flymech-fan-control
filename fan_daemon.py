@@ -89,10 +89,63 @@ def load_saved_curves():
         except Exception:
             pass
 
+def sync_oem_fan_tables(curves):
+    """深度同步温控曲线到机械革命官方控制台的所有 UserFanTables 模板中，彻底杜绝唤醒覆盖与暴转"""
+    try:
+        import shutil
+        all_m = glob.glob(r'C:\Program Files\OEM\**\UserFanTables\**\M*.json', recursive=True)
+        for p in all_m:
+            if p.endswith('.bak'): continue
+            bak = p + '.bak'
+            if not os.path.exists(bak):
+                try: shutil.copy2(p, bak)
+                except: pass
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                data['Activated'] = True
+                data['FanControlRespective'] = True
+                data['CpuTemp_DefaultMaxLevel'] = 14
+                data['GpuTemp_DefaultMaxLevel'] = 14
+                
+                cpu_pts = []
+                for item in curves.get('cpu', []):
+                    cpu_pts.append({
+                        'ID': item['id'],
+                        'UpT': int(item['upt']),
+                        'DownT': int(item['downt']),
+                        'Duty': int(item['duty'])
+                    })
+                while len(cpu_pts) < 16:
+                    last = cpu_pts[-1] if cpu_pts else {'UpT': 95, 'DownT': 90, 'Duty': 100}
+                    cpu_pts.append({'ID': len(cpu_pts), 'UpT': last['UpT'], 'DownT': last['DownT'], 'Duty': last['Duty']})
+                data['CPU'] = cpu_pts
+
+                gpu_pts = []
+                for item in curves.get('gpu', []):
+                    gpu_pts.append({
+                        'ID': item['id'],
+                        'UpT': int(item['upt']),
+                        'DownT': int(item['downt']),
+                        'Duty': int(item['duty'])
+                    })
+                while len(gpu_pts) < 16:
+                    last = gpu_pts[-1] if gpu_pts else {'UpT': 90, 'DownT': 85, 'Duty': 100}
+                    gpu_pts.append({'ID': len(gpu_pts), 'UpT': last['UpT'], 'DownT': last['DownT'], 'Duty': last['Duty']})
+                data['GPU'] = gpu_pts
+
+                with open(p, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 def save_custom_curves():
     try:
         with open(CURVE_CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(active_curves, f, indent=2, ensure_ascii=False)
+        sync_oem_fan_tables(active_curves)
     except Exception:
         pass
 
@@ -229,7 +282,7 @@ def read_ec_telemetry():
 
 def apply_active_fan_curves(force_boost=False):
     """将 active_curves 直接写入 EC 风扇表并使能"""
-    global fan_mgr_instance, set_ec_table_method, FanTable1p5_Type, FanTable1p5Buffer_Type, WriteEC
+    global fan_mgr_instance, set_ec_table_method, set_respective_method, FanTable1p5_Type, FanTable1p5Buffer_Type, WriteEC
     
     if force_boost:
         if WriteEC:
@@ -245,8 +298,14 @@ def apply_active_fan_curves(force_boost=False):
     try:
         import System
 
+        # 确保双风扇独立控制使能
+        if set_respective_method and fan_mgr_instance:
+            try:
+                set_respective_method.Invoke(fan_mgr_instance, [True])
+            except Exception:
+                pass
+
         ft = System.Activator.CreateInstance(FanTable1p5_Type)
-        ft.Name = "M1T1"
         ft.Activated = True
         ft.FanControlRespective = True
         ft.CpuTemp_DefaultMaxLevel = 14
@@ -278,7 +337,10 @@ def apply_active_fan_curves(force_boost=False):
         ft.CPU = cpu_arr
         ft.GPU = gpu_arr
 
-        set_ec_table_method.Invoke(fan_mgr_instance, [ft])
+        # 同时向所有运行模式 (Office=M1T1, Gaming=M2T1, Turbo=M3T1) 灌入温控表
+        for mode_table in ["M1T1", "M2T1", "M3T1"]:
+            ft.Name = mode_table
+            set_ec_table_method.Invoke(fan_mgr_instance, [ft])
     except Exception:
         pass
 
@@ -1705,6 +1767,8 @@ def main():
     apply_active_fan_curves(force_boost=False)
     
     poll_counter = 0
+    last_ec_heal_time = 0
+    last_periodic_ec_sync = time.time()
     while True:
         try:
             if not fan.all_interfaces:
@@ -1715,6 +1779,26 @@ def main():
             telemetry_data["gpu_temp"] = gpu_t
             effective_temp = max(cpu_t, gpu_t)
             telemetry_data["max_temp"] = effective_temp
+
+            now = time.time()
+            # 异常暴走逃逸自愈检测 (EC Watchdog):
+            # 若 CPU 核心温度低于 68℃，但 EC CPU 风扇 duty 却跑满 (>= 80% 或转速 >= 3800 RPM):
+            # 表明系统刚刚从锁屏/休眠唤醒，或底层服务/ACPI重置了 EC，立即毫秒级自愈！
+            if not telemetry_data.get("internal_fan_boost", False):
+                cpu_duty = telemetry_data.get("cpu_fan_duty", 0)
+                cpu_rpm = telemetry_data.get("cpu_fan_rpm", 0)
+                gpu_duty = telemetry_data.get("gpu_fan_duty", 0)
+                gpu_rpm = telemetry_data.get("gpu_fan_rpm", 0)
+                
+                ec_anomaly = (cpu_t < 68.0 and (cpu_duty >= 80 or cpu_rpm >= 3800)) or \
+                             (gpu_t < 65.0 and (gpu_duty >= 80 or gpu_rpm >= 3800))
+                
+                if ec_anomaly and (now - last_ec_heal_time > 3.0):
+                    last_ec_heal_time = now
+                    apply_active_fan_curves(force_boost=False)
+                elif now - last_periodic_ec_sync > 60.0:
+                    last_periodic_ec_sync = now
+                    apply_active_fan_curves(force_boost=False)
 
             if poll_counter % 5 == 0:
                 read_mechrevo_status()

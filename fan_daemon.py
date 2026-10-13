@@ -193,33 +193,63 @@ telemetry_data = {
 # --- 1. NVML GPU 硬件遥测 ---
 nvml_lib = None
 gpu_handle = None
-try:
-    nvml_paths = glob.glob(r'C:\Windows\System32\nvml.dll') + glob.glob(r'C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll')
-    if nvml_paths:
-        nvml_lib = ctypes.CDLL(nvml_paths[0])
-        if nvml_lib.nvmlInit_v2() == 0:
-            h = ctypes.c_void_p()
-            if nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h)) == 0:
-                gpu_handle = h
-except Exception:
-    nvml_lib = None
-    gpu_handle = None
+
+def init_nvml():
+    global nvml_lib, gpu_handle
+    try:
+        if not nvml_lib:
+            nvml_paths = glob.glob(r'C:\Windows\System32\nvml.dll') + glob.glob(r'C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll')
+            if not nvml_paths:
+                return False
+            nvml_lib = ctypes.CDLL(nvml_paths[0])
+            
+        ret = nvml_lib.nvmlInit_v2()
+        if ret not in (0, 9):  # 0: SUCCESS, 9: ALREADY_INITIALIZED
+            nvml_lib = None
+            gpu_handle = None
+            return False
+            
+        h = ctypes.c_void_p()
+        ret = nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h))
+        if ret == 0:
+            gpu_handle = h
+            return True
+        else:
+            gpu_handle = None
+            return False
+    except Exception:
+        gpu_handle = None
+        return False
+
+# 启动时初次尝试加载
+init_nvml()
 
 class NVML_UTILIZATION(ctypes.Structure):
     _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
 def get_gpu_telemetry():
-    if not nvml_lib or not gpu_handle:
-        return None, 0, 0
+    global gpu_handle
+    if not gpu_handle:
+        if not init_nvml():
+            return None, 0, 0
     try:
         temp = ctypes.c_uint()
-        nvml_lib.nvmlDeviceGetTemperature(gpu_handle, 0, ctypes.byref(temp))
+        ret_temp = nvml_lib.nvmlDeviceGetTemperature(gpu_handle, 0, ctypes.byref(temp))
+        if ret_temp != 0:
+            gpu_handle = None
+            return None, 0, 0
+
         power = ctypes.c_uint()
-        nvml_lib.nvmlDeviceGetPowerUsage(gpu_handle, ctypes.byref(power))
+        ret_pwr = nvml_lib.nvmlDeviceGetPowerUsage(gpu_handle, ctypes.byref(power))
+        pwr_val = round(power.value / 1000.0, 1) if ret_pwr == 0 else 0
+
         util = NVML_UTILIZATION()
-        nvml_lib.nvmlDeviceGetUtilizationRates(gpu_handle, ctypes.byref(util))
-        return float(temp.value), round(power.value / 1000.0, 1), int(util.gpu)
+        ret_util = nvml_lib.nvmlDeviceGetUtilizationRates(gpu_handle, ctypes.byref(util))
+        util_val = int(util.gpu) if ret_util == 0 else 0
+
+        return float(temp.value), pwr_val, util_val
     except Exception:
+        gpu_handle = None
         return None, 0, 0
 
 # --- 2. 机械革命原生 ACPI/EC 直连与风扇曲线编译引擎 ---
@@ -245,6 +275,8 @@ set_ec_table_method = None
 set_respective_method = None
 FanTable1p5_Type = None
 FanTable1p5Buffer_Type = None
+cpu_info_instance = None
+cpu_get_temp_method = None
 
 try:
     import clr
@@ -263,6 +295,16 @@ try:
         set_respective_method = mgr_type.GetMethod('SetEcFanControlRespective', BindingFlags.NonPublic | BindingFlags.Instance)
         if set_respective_method and fan_mgr_instance:
             set_respective_method.Invoke(fan_mgr_instance, [True])
+
+        # 初始化官方 CPUInfo 用于毫秒级实时温度采集
+        try:
+            cpu_info_types = [t for t in asm.GetTypes() if t.Name == 'CPUInfo']
+            if cpu_info_types:
+                cpu_info_instance = System.Activator.CreateInstance(cpu_info_types[0])
+                cpu_get_temp_method = cpu_info_types[0].GetMethod('GetCPUTemperature')
+        except Exception:
+            cpu_info_instance = None
+            cpu_get_temp_method = None
 except Exception:
     fan_mgr_instance = None
 
@@ -274,24 +316,13 @@ def read_ec_telemetry():
             telemetry_data["gpu_fan_duty"] = ReadEC(0x75C) // 2
             telemetry_data["cpu_fan_rpm"] = (ReadEC(0x464) << 8) | ReadEC(0x465)
             telemetry_data["gpu_fan_rpm"] = (ReadEC(0x46C) << 8) | ReadEC(0x46B)
-            
-            boost_byte = ReadEC(0x751)
-            telemetry_data["internal_fan_boost"] = bool(boost_byte & 0x80)
         except Exception:
             pass
 
-def apply_active_fan_curves(force_boost=False):
-    """将 active_curves 直接写入 EC 风扇表并使能"""
-    global fan_mgr_instance, set_ec_table_method, set_respective_method, FanTable1p5_Type, FanTable1p5Buffer_Type, WriteEC
+def apply_active_fan_curves(force_boost=False, target_mode=None):
+    """根据选择的真实运行模式，将风扇表直接写入对应 EC 表并使能"""
+    global fan_mgr_instance, set_ec_table_method, set_respective_method, FanTable1p5_Type, FanTable1p5Buffer_Type
     
-    if force_boost:
-        if WriteEC:
-            WriteEC(0x751, 0x80)
-        return
-
-    if WriteEC:
-        WriteEC(0x751, 0x00)
-
     if not fan_mgr_instance or not set_ec_table_method:
         return
 
@@ -317,7 +348,8 @@ def apply_active_fan_curves(force_boost=False):
             buf.ID = System.UInt32(i)
             buf.UpT = System.Byte(int(item["upt"]))
             buf.DownT = System.Byte(int(item["downt"]))
-            buf.Duty = System.Byte(min(100, max(0, int(item["duty"]))))
+            duty_val = 100 if force_boost else min(100, max(0, int(item["duty"])))
+            buf.Duty = System.Byte(duty_val)
             cpu_list.append(buf)
 
         gpu_list = []
@@ -326,7 +358,8 @@ def apply_active_fan_curves(force_boost=False):
             buf.ID = System.UInt32(i)
             buf.UpT = System.Byte(int(item["upt"]))
             buf.DownT = System.Byte(int(item["downt"]))
-            buf.Duty = System.Byte(min(100, max(0, int(item["duty"]))))
+            duty_val = 100 if force_boost else min(100, max(0, int(item["duty"])))
+            buf.Duty = System.Byte(duty_val)
             gpu_list.append(buf)
 
         cpu_arr = System.Array.CreateInstance(FanTable1p5Buffer_Type, len(cpu_list))
@@ -337,14 +370,30 @@ def apply_active_fan_curves(force_boost=False):
         ft.CPU = cpu_arr
         ft.GPU = gpu_arr
 
-        # 同时向所有运行模式 (Office=M1T1, Gaming=M2T1, Turbo=M3T1) 灌入温控表
-        for mode_table in ["M1T1", "M2T1", "M3T1"]:
-            ft.Name = mode_table
-            set_ec_table_method.Invoke(fan_mgr_instance, [ft])
+        # 精准写入当前激活模式的温控表 (Office=M1T1, Gaming=M2T1, Turbo=M3T1)，绝不篡改主板模式
+        cur_mode = target_mode or telemetry_data.get("mechrevo_mode", "office")
+        table_map = {
+            "office": "M1T1",
+            "gaming": "M2T1",
+            "turbo": "M3T1"
+        }
+        mode_table = table_map.get(cur_mode, "M1T1")
+        ft.Name = mode_table
+        set_ec_table_method.Invoke(fan_mgr_instance, [ft])
     except Exception:
         pass
 
 def get_cpu_temp():
+    # 1. 优先使用机械革命原生 GCUService.CPUInfo 采集实时温度 (灵敏响应，无 ACPI 静态假死)
+    if cpu_get_temp_method and cpu_info_instance:
+        try:
+            val = cpu_get_temp_method.Invoke(cpu_info_instance, [])
+            if val is not None and 25 <= float(val) <= 115:
+                return round(float(val), 1)
+        except Exception:
+            pass
+
+    # 2. 兜底回退 root\wmi MSAcpi_ThermalZoneTemperature
     try:
         w_acpi = wmi.WMI(namespace="root\\wmi")
         for t in w_acpi.MSAcpi_ThermalZoneTemperature():
@@ -408,6 +457,23 @@ def switch_mechrevo_mode_async(target_mode):
         }
         cmd_param = mode_map.get(target_mode, "OPERATING_OFFICE_MODE")
         try:
+            # 1. 同步更新底层 MainOption.json 中的真实运行模式，防止轮询被动覆盖
+            paths = glob.glob(r'C:\Program Files\OEM\**\MainOption.json', recursive=True)
+            if paths:
+                mode_int = {"office": 0, "gaming": 1, "turbo": 2}.get(target_mode, 0)
+                try:
+                    with open(paths[0], 'r', encoding='utf-8') as f:
+                        mo = json.load(f)
+                    mo["OperatingMode"] = mode_int
+                    with open(paths[0], 'w', encoding='utf-8') as f:
+                        json.dump(mo, f, indent=2)
+                except Exception:
+                    pass
+
+            # 2. 调用当前真实模式对应的风扇表
+            apply_active_fan_curves(force_boost=telemetry_data.get("internal_fan_boost", False), target_mode=target_mode)
+
+            # 3. 异步尝试调用官方切换管道
             subprocess.run(
                 ['powershell.exe', '-ExecutionPolicy', 'Bypass', '-File', SWITCH_SCRIPT_PATH, '-cmd', cmd_param],
                 capture_output=True,
@@ -1795,9 +1861,6 @@ def main():
                 
                 if ec_anomaly and (now - last_ec_heal_time > 3.0):
                     last_ec_heal_time = now
-                    apply_active_fan_curves(force_boost=False)
-                elif now - last_periodic_ec_sync > 60.0:
-                    last_periodic_ec_sync = now
                     apply_active_fan_curves(force_boost=False)
 
             if poll_counter % 5 == 0:
